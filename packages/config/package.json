@@ -1,0 +1,7 @@
+{
+  "name": "@openmonitor/config",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "files": ["eslint-preset.js", "index.js"]
+}

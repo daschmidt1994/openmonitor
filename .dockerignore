@@ -1,0 +1,14 @@
+**/node_modules
+**/dist
+**/build
+**/.next
+**/out
+**/coverage
+**/*.tsbuildinfo
+**/.turbo
+packages/database/generated
+.git
+.env
+.env.*
+!.env.example
+apps/android

@@ -1,0 +1,121 @@
+name: openmonitor
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openmonitor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-openmonitor}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openmonitor} -d ${POSTGRES_DB:-openmonitor}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [openmonitor]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [openmonitor]
+
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/docker/migrate.Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-openmonitor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openmonitor}?schema=public
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [openmonitor]
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER:-openmonitor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openmonitor}?schema=public
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET is required}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL_DAYS: ${JWT_REFRESH_TTL_DAYS:-30}
+      API_TOKEN_PREFIX: ${API_TOKEN_PREFIX:-om_}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+      REGISTRATION_ENABLED: ${REGISTRATION_ENABLED:-true}
+      CHECK_RETENTION_DAYS: ${CHECK_RETENTION_DAYS:-90}
+    ports:
+      - "${API_PORT:-3001}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [openmonitor]
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    restart: unless-stopped
+    cap_add:
+      - NET_RAW # required for the ICMP `ping` binary used by PING monitors
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-openmonitor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openmonitor}?schema=public
+      REDIS_URL: redis://redis:6379
+      SCHEDULER_POLL_INTERVAL_MS: ${SCHEDULER_POLL_INTERVAL_MS:-5000}
+      CHECK_CONCURRENCY: ${CHECK_CONCURRENCY:-10}
+      CHECK_RETENTION_DAYS: ${CHECK_RETENTION_DAYS:-90}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [openmonitor]
+
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:3001}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:3001}
+      # Server-side (SSR) requests run inside this container and must reach
+      # the API via the Docker network, not the browser-facing URL above.
+      API_INTERNAL_URL: http://api:3001
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      - api
+    networks: [openmonitor]
+
+networks:
+  openmonitor:
+
+volumes:
+  postgres-data:
+  redis-data:

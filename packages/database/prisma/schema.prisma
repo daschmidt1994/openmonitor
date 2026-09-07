@@ -1,0 +1,383 @@
+// OpenMonitor relational schema.
+// Design notes:
+// - MonitorCheck is the highest-growth table (one row per check per interval).
+//   It is indexed on (monitorId, checkedAt DESC) for fast history/pagination
+//   queries and retention pruning. See packages/worker retention job.
+// - Monitor keeps small denormalized "current state" fields (currentStatus,
+//   consecutiveFailures, lastCheckAt) so dashboard list queries never need to
+//   scan MonitorCheck.
+// - All user-owned resources carry userId with an index, and application code
+//   MUST filter by the authenticated user's id (see apps/api CASL-lite guards)
+//   to enforce tenant isolation at the query layer, not just the UI layer.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  USER
+  READONLY
+}
+
+enum MonitorType {
+  HTTP
+  TCP
+  PING
+  DNS
+  SSL
+  JSON_QUERY
+}
+
+enum CheckStatus {
+  UP
+  DOWN
+  PENDING
+}
+
+enum IncidentStatus {
+  ONGOING
+  RESOLVED
+}
+
+enum NotificationType {
+  EMAIL
+  DISCORD
+  SLACK
+  TELEGRAM
+  WEBHOOK
+}
+
+enum DnsRecordType {
+  A
+  AAAA
+  CNAME
+  MX
+  TXT
+  NS
+}
+
+// ---------------------------------------------------------------------------
+// Users & Auth
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  username      String   @unique
+  passwordHash  String
+  role          Role     @default(USER)
+  active        Boolean  @default(true)
+  timezone      String   @default("UTC")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  monitors             Monitor[]
+  notificationProviders NotificationProvider[]
+  apiTokens            ApiToken[]
+  refreshTokens        RefreshToken[]
+  statusPages          StatusPage[]
+  tags                 Tag[]
+  auditLogs            AuditLog[]
+  passwordResetTokens  PasswordResetToken[]
+
+  @@index([role])
+  @@map("users")
+}
+
+model RefreshToken {
+  id              String    @id @default(uuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash       String    @unique
+  userAgent       String?
+  ipAddress       String?
+  expiresAt       DateTime
+  revokedAt       DateTime?
+  replacedByToken String?
+  createdAt       DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model ApiToken {
+  id          String     @id @default(uuid())
+  userId      String
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  tokenPrefix String
+  tokenHash   String     @unique
+  scopes      String[]
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime   @default(now())
+
+  @@index([userId])
+  @@map("api_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Monitors
+// ---------------------------------------------------------------------------
+
+model Monitor {
+  id          String      @id @default(uuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?
+  type        MonitorType
+
+  // Target
+  target      String // URL for HTTP/SSL/JSON_QUERY, hostname for PING/DNS/TCP
+  port        Int?
+
+  // Scheduling
+  interval    Int         @default(60) // seconds
+  timeout     Int         @default(10) // seconds
+  retries     Int         @default(3)
+  retryInterval Int       @default(20) // seconds between retries
+
+  // HTTP-specific
+  httpMethod          String?  @default("GET")
+  httpHeaders          Json?
+  httpBody              String?
+  expectedStatusCodes  String? @default("200-299") // e.g. "200-299,301,302"
+  keyword               String?
+  keywordInverted       Boolean @default(false)
+  followRedirects       Boolean @default(true)
+  ignoreTlsErrors       Boolean @default(false)
+
+  // JSON query
+  jsonPath          String?
+  jsonExpectedValue String?
+
+  // DNS
+  dnsRecordType    DnsRecordType?
+  dnsExpectedValue String?
+  dnsResolver      String?
+
+  // SSL
+  checkSslExpiry        Boolean @default(false)
+  sslExpiryThresholdDays Int    @default(14)
+
+  // Behavior
+  upsideDown  Boolean     @default(false)
+  active      Boolean     @default(true)
+
+  // Denormalized current state (fast dashboard reads)
+  currentStatus       CheckStatus @default(PENDING)
+  consecutiveFailures Int         @default(0)
+  lastCheckAt         DateTime?
+  nextCheckAt         DateTime?
+
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  checks              MonitorCheck[]
+  incidents           Incident[]
+  tags                MonitorTag[]
+  notifications       MonitorNotification[]
+  statusPageMonitors  StatusPageMonitor[]
+
+  @@index([userId])
+  @@index([active])
+  @@index([nextCheckAt])
+  @@map("monitors")
+}
+
+model MonitorCheck {
+  id           BigInt      @id @default(autoincrement())
+  monitorId    String
+  monitor      Monitor     @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+
+  status       CheckStatus
+  responseTime Int? // milliseconds
+  statusCode   Int?
+  message      String?
+
+  certExpiresAt   DateTime?
+  certDaysRemaining Int?
+
+  checkedAt    DateTime    @default(now())
+
+  @@index([monitorId, checkedAt(sort: Desc)])
+  @@map("monitor_checks")
+}
+
+// ---------------------------------------------------------------------------
+// Incidents
+// ---------------------------------------------------------------------------
+
+model Incident {
+  id          String         @id @default(uuid())
+  monitorId   String
+  monitor     Monitor        @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+
+  status      IncidentStatus @default(ONGOING)
+  startedAt   DateTime       @default(now())
+  resolvedAt  DateTime?
+  message     String?
+
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@index([monitorId, startedAt(sort: Desc)])
+  @@index([status])
+  @@map("incidents")
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+model Tag {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name   String
+  color  String @default("#64748b")
+
+  monitors MonitorTag[]
+
+  @@unique([userId, name])
+  @@map("tags")
+}
+
+model MonitorTag {
+  monitorId String
+  monitor   Monitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  tagId     String
+  tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([monitorId, tagId])
+  @@map("monitor_tags")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model NotificationProvider {
+  id       String            @id @default(uuid())
+  userId   String
+  user     User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name     String
+  type     NotificationType
+  config   Json // provider-specific config; secrets encrypted at rest by app layer
+  active   Boolean           @default(true)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  monitors MonitorNotification[]
+
+  @@index([userId])
+  @@map("notification_providers")
+}
+
+model MonitorNotification {
+  monitorId          String
+  monitor             Monitor               @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  providerId          String
+  provider             NotificationProvider  @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  notifyOnDown         Boolean @default(true)
+  notifyOnRecovery      Boolean @default(true)
+  resendIntervalMinutes Int     @default(0) // 0 = do not resend while still down
+  lastNotifiedAt         DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@id([monitorId, providerId])
+  @@map("monitor_notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Status Pages
+// ---------------------------------------------------------------------------
+
+model StatusPage {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  slug        String   @unique
+  name        String
+  description String?
+  logoUrl     String?
+  isPublic    Boolean  @default(true)
+  customCss   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  monitors StatusPageMonitor[]
+
+  @@index([userId])
+  @@map("status_pages")
+}
+
+model StatusPageMonitor {
+  statusPageId String
+  statusPage   StatusPage @relation(fields: [statusPageId], references: [id], onDelete: Cascade)
+  monitorId    String
+  monitor      Monitor    @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  order        Int        @default(0)
+  label        String?
+
+  @@id([statusPageId, monitorId])
+  @@map("status_page_monitors")
+}
+
+// ---------------------------------------------------------------------------
+// System / Audit
+// ---------------------------------------------------------------------------
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
