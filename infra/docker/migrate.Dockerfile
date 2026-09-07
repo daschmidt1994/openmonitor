@@ -8,7 +8,7 @@ RUN apk add --no-cache openssl
 RUN corepack enable
 WORKDIR /app
 
-COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
 COPY packages/database/package.json packages/database/package.json
 RUN pnpm install --frozen-lockfile --filter @openmonitor/database...
 
