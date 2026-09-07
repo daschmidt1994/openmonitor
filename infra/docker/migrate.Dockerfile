@@ -15,5 +15,9 @@ RUN pnpm install --frozen-lockfile --filter @openmonitor/database...
 COPY packages/database packages/database
 WORKDIR /app/packages/database
 RUN npx prisma generate
+# Compile to plain JS at build time so the runtime image never needs
+# ts-node or tsconfig resolution (which previously broke here because
+# tsconfig.json's "extends" points outside this Dockerfile's copied files).
+RUN npx tsc -p tsconfig.json
 
-ENTRYPOINT ["sh", "-c", "npx prisma migrate deploy && node -r ts-node/register/transpile-only src/seed.ts"]
+ENTRYPOINT ["sh", "-c", "npx prisma migrate deploy && node dist/seed.js"]
